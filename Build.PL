@@ -1,0 +1,25 @@
+#!/usr/bin/perl
+
+use strict;
+
+use Module::Build;
+
+Module::Build->new(
+	'module_name'        => 'MogileFS::Client::Fuse',
+	'create_makefile_pl' => 'traditional',
+	'dist_abstract'      => 'Fuse binding for MogileFS',
+	'dist_author'        => 'Daniel Frett <daniel.frett@gmail.com>',
+	'license'            => 'bsd',
+	'configure_requires' => {
+		'Module::Build'               => '0.36',
+	},
+	'build_requires'     => {
+		'Test::More'                  => 0,
+	},
+	'requires'           => {
+		'Fuse'                        => '0.11',
+		'MogileFS::Client::FilePaths' => 0,
+		'Params::Validate'            => 0,
+		'Scalar::Util'                => 0,
+	},
+)->create_build_script();
