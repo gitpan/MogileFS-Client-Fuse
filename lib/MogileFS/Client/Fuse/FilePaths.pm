@@ -1,11 +1,12 @@
 package MogileFS::Client::Fuse::FilePaths;
 
 use strict;
+use warnings;
 use mro 'c3';
 use threads::shared;
 use base qw{MogileFS::Client::Fuse};
 
-our $VERSION = 0.02;
+our $VERSION = 0.03;
 
 use Errno qw{EEXIST EIO ENOENT};
 use MogileFS::Client::FilePaths;
@@ -36,7 +37,7 @@ sub _init {
 	return $self;
 }
 
-#method that returns a directory listing for the current directory
+# method that returns a directory listing for the current directory as a HASHREF
 sub _listDir {
 	my $self = shift;
 	my ($path) = @_;
@@ -44,23 +45,26 @@ sub _listDir {
 	my $config = $self->_config;
 
 	#short-circuit if the dir cache is disabled
-	return $self->MogileFS->list($path) if(!$config->{'filepaths.dircache'});
+	return {map {($_->{'name'} => $_)} $self->MogileFS->list($path)} if(!$config->{'filepaths.dircache'});
 
 	#check to see if the specified path is cached
 	my $cache = $self->{'dirs'};
-	my $dir = $cache->{$path} || {};
+	my $dir = $cache->{$path};
 
 	#load the directory listing if the current cached listing is stale
-	if($dir->{'expires'} <= time) {
+	if(!defined($dir) || $dir->{'expires'} <= time) {
 		#fetch and store the files in the dir cache
-		$dir = $cache->{$path} = shared_clone({
+		$dir = {
 			'expires' => time + $config->{'filepaths.dircache.duration'},
-			'files' => [$self->MogileFS->list($path)],
-		});
+			'files' => {
+				map {($_->{'name'} => $_)} $self->MogileFS->list($path),
+			},
+		};
+		$cache->{$path} = shared_clone($dir);
 	}
 
 	#return the files for the current directory
-	return @{$dir->{'files'}};
+	return $dir->{'files'};
 }
 
 #method that flushes the specified dir from the dir cache
@@ -93,11 +97,9 @@ sub get_file_info($) {
 
 	#look up meta-data in the directory containing the specified file
 	my $finfo = eval {
-		my $mogc = $self->MogileFS();
-		foreach($self->_listDir($dir)) {
-			return $_ if($_->{'name'} eq $file);
-		}
-		return undef;
+		my $files = $self->_listDir($dir);
+		return undef if(!(ref($files) eq 'HASH' && exists $files->{$file}));
+		return $files->{$file};
 	};
 
 	#return the found file info
@@ -187,11 +189,11 @@ sub fuse_getdir {
 	$path = $self->sanitize_path($path);
 
 	#fetch all the files in the specified directory
-	my @files = eval {$self->_listDir($path)};
+	my @names = eval {keys %{$self->_listDir($path)}};
 	return -EIO() if($@);
 
 	#return this directory listing
-	return ('.', '..', map {$_->{'name'}} @files), 0;
+	return ('.', '..', @names), 0;
 }
 
 sub fuse_mkdir {
@@ -261,9 +263,12 @@ sub fuse_rename {
 	#attempt renaming the specified file
 	my $mogc = $self->MogileFS();
 	my $response = eval {
-		$mogc->rename($old, $new);
-		$self->_flushDir($old, 1);
-		$self->_flushDir($new, 1);
+		my $resp = $mogc->rename($old, $new);
+		if($resp) {
+			$self->_flushDir($old, 1);
+			$self->_flushDir($new, 1);
+		}
+		return $resp;
 	};
 	if($@ || !$response) {
 		($?, $!) = (-1, '');
