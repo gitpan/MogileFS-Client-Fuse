@@ -2,11 +2,14 @@ package MogileFS::Client::Fuse::BufferedFile;
 
 use strict;
 use warnings;
+use MRO::Compat;
 use mro 'c3';
 use threads::shared;
 use base qw{MogileFS::Client::Fuse::File};
 
-our $VERSION = 0.03;
+Class::C3::initialize();
+
+our $VERSION = 0.04;
 
 use constant BUFFERSIZE => 64*1024;
 
@@ -14,7 +17,7 @@ use MogileFS::Client::Fuse::Constants qw{:LEVELS};
 
 ##Instance Methods
 
-sub _fsync {
+sub _flushBuffer {
 	my $self = shift;
 
 	#lock the buffer while processing
@@ -33,26 +36,32 @@ sub _fsync {
 		$buffer->{'end'} = $buffer->{'start'} = 0;
 	}
 
-	#process any other fsync methods as necessary
+	return 1;
+}
+
+sub _fsync {
+	my $self = shift;
+
+	# flush the write buffer
+	$self->_flushBuffer();
+
+	# process any other fsync methods as necessary
 	return $self->next::method(@_);
 }
 
-sub _init {
+# method that will (re)initialize the I/O buffer
+sub _initIo {
 	my $self = shift;
-	my (%opt) = @_;
 
-	#initialize the base object
-	$self = $self->next::method(%opt);
-	return if(!$self);
-
-	#setup the buffer data structure
+	# (re)initialize the buffer data structure
 	$self->{'buffer'} = shared_clone({
 		'data'  => '',
 		'start' => 0,
 		'end'   => 0,
 	});
 
-	return $self;
+	# (re)initialize the base object
+	return $self->next::method();
 }
 
 sub _read {
@@ -60,7 +69,7 @@ sub _read {
 	my ($offset, $buf, %opt) = @_;
 
 	#flush the write buffer if this is an output file read
-	$self->fsync() if($opt{'output'});
+	$self->_flushBuffer() if($opt{'output'});
 
 	#issue actual read request
 	return $self->next::method($offset, $buf, %opt);
@@ -91,7 +100,7 @@ sub _write {
 
 		#flush the buffer if it is full or current data isn't adjacent to the buffer
 		if($offset != $buffer->{'end'} || $buffer->{'end'} - $buffer->{'start'} > BUFFERSIZE) {
-			$self->fsync();
+			$self->_flushBuffer();
 			$buffer->{'end'} = $buffer->{'start'} = $offset;
 		}
 

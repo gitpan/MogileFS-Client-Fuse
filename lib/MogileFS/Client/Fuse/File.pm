@@ -4,7 +4,7 @@ use strict;
 use warnings;
 use threads::shared;
 
-our $VERSION = 0.03;
+our $VERSION = 0.04;
 
 use Errno qw{EIO};
 use Fcntl;
@@ -55,10 +55,6 @@ sub _cow {
 sub _flush {
 	my $self = shift;
 
-	#copy any data that hasn't been copied yet and fsync any buffers
-	$self->_cow($self->{'cowPtr'} + 1024*1024) while(defined $self->{'cowPtr'});
-	$self->fsync();
-
 	#commit the output file
 	my $dest = $self->getOutputDest();
 	my $res = eval {
@@ -106,8 +102,11 @@ sub _init {
 	#initialize the I/O attributes
 	$self->_initIo;
 
+	# short-circuit if the file is opened for writing and MogileFS is mounted readonly
+	return undef if($self->writable && $self->fuse->_config->{'readonly'});
+
 	#short-circuit if the file isn't opened for writing and doesn't exist in MogileFS
-	return if(!$self->writable && !$self->getPaths());
+	return undef if(!$self->writable && !$self->getPaths());
 
 	#return the initialized object
 	return $self;
@@ -156,7 +155,7 @@ sub _read {
 	my $res;
 	foreach my $uri ($opt{'output'} ? $self->getOutputDest->{'path'} : $self->getPaths()) {
 		#attempt retrieving the requested data
-		$res = $ua->request(HTTP::Request->new('GET' => $uri, $headers));
+		$res = $ua->send_request(HTTP::Request->new('GET' => $uri, $headers));
 
 		#check for errors
 		if($res->is_error) {
@@ -202,11 +201,12 @@ sub _write {
 			#build request
 			my $req = HTTP::Request->new('PUT' => $dest->{'path'}, [
 				'Content-Range' => 'bytes ' . $offset . '-' . ($offset + $len - 1) . '/*',
+				'Content-Length' => $len,
 			]);
 			$req->content_ref($buf);
 
 			#attempt this raw write
-			my $res = $self->fuse->ua->request($req);
+			my $res = $self->fuse->ua->send_request($req);
 			if(!$res || $res->is_error) {
 				$self->fuse->log(ERROR, 'Error writing data to: ' . $self->path);
 				$dest->{'error'} = 1;
@@ -242,6 +242,11 @@ sub flush {
 
 	#flush the current I/O handles if we are in a write mode and the output file is dirty
 	if($self->writable && $self->dirty) {
+		# copy any data that hasn't been copied yet and fsync any buffers
+		$self->_cow($self->{'cowPtr'} + 1024*1024) while(defined $self->{'cowPtr'});
+		$self->fsync();
+
+		# flush file
 		$self->_flush();
 	}
 
@@ -279,14 +284,14 @@ sub getOutputDest {
 				});
 			};
 			if($@ || !$tmpFile) {
-				$self->fuse->log(ERROR, 'Error creating temporary file in MogileFS: ' . $self->path);
+				$self->fuse->log(ERROR, 'Error creating file for output in MogileFS tracker: ' . $self->path);
 				die;
 			}
 
 			#attempt creating a file at the specified location
-			my $res = $self->fuse->ua->request(HTTP::Request->new('PUT' => $tmpFile->{'path'}));
+			my $res = $self->fuse->ua->request(HTTP::Request->new('PUT' => $tmpFile->{'path'}, ['Content-Length' => 0]));
 			if(!$res->is_success()) {
-				$self->fuse->log(ERROR, 'Error creating temporary file in MogileFS: ' . $self->path);
+				$self->fuse->log(ERROR, 'Error creating file on MogileFS storage node ' . $tmpFile->{'path'} . ' for ' . $self->path);
 				die;
 			}
 

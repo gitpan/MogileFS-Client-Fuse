@@ -2,13 +2,16 @@ package MogileFS::Client::Fuse::FilePaths;
 
 use strict;
 use warnings;
+use MRO::Compat;
 use mro 'c3';
 use threads::shared;
 use base qw{MogileFS::Client::Fuse};
 
-our $VERSION = 0.03;
+Class::C3::initialize();
 
-use Errno qw{EEXIST EIO ENOENT};
+our $VERSION = 0.04;
+
+use Errno qw{EACCES EEXIST EIO ENOENT};
 use MogileFS::Client::FilePaths;
 use MogileFS::Client::Fuse::Constants qw{:LEVELS};
 use Params::Validate qw{validate_with BOOLEAN SCALAR};
@@ -78,6 +81,49 @@ sub _flushDir {
 	$self->_flushDir($1, 1) if($flushParent && $path =~ m!^(.*/)[^/]*/$!so);
 
 	return;
+}
+
+sub _generateAttrs {
+	my $self = shift;
+	my ($finfo) = @_;
+
+	if(ref($finfo) eq 'HASH') {
+		# Cook some permissions since we don't store this information in mogile
+		#TODO: how should we set file/dir permissions?
+		my $modes = 0444; # read bit
+		$modes |= 0222 if(!$self->_config->{'readonly'}); # write bit
+		$modes |= 0111 if($finfo->{'is_directory'}); # execute bit
+		$modes |= (($finfo->{'is_directory'} ? 0040 : 0100) << 9); # entry type bits
+
+		my $size = $finfo->{'size'} || 0;
+
+		# set some generic attributes
+		my $blksize = 1024;
+		my $blocks = (($size - 1) / $blksize) + 1;
+		my ($atime, $ctime, $mtime);
+		$ctime = $mtime = $finfo->{'modified'} || time;
+		$atime = time;
+
+		# generate and return the entry attributes
+		#TODO: set more sane values for file attributes
+		return [
+			0,        # device
+			0,        # inode
+			$modes,   # mode
+			1,        # hard links
+			0,        # user id
+			0,        # group id
+			0,        # device identifier (special files)
+			$size,    # size (in bytes)
+			$atime,   # last access time
+			$mtime,   # last modified time
+			$ctime,   # inode change time
+			$blksize, # block size
+			$blocks,  # number of blocks
+		];
+	}
+
+	return [];
 }
 
 #fetch meta-data about the specified file
@@ -152,35 +198,8 @@ sub fuse_getattr {
 	my $finfo = $self->get_file_info($path);
 	return -ENOENT() if(!defined $finfo);
 
-	# Cook some permissions since we don't store this information in mogile
-	#TODO: how should we set file/dir permissions?
-	my $modes =
-		$finfo->{'is_directory'} ? (0040 << 9) + 0777 :
-		(0100 << 9) + 0666;
-	my $size = $finfo->{'size'} || 0;
-
-	#set some generic attributes
-	#TODO: set more sane values for file attributes
-	my ($dev, $ino, $rdev, $blocks, $gid, $uid, $nlink, $blksize) = (0,0,0,1,0,0,1,1024);
-	my ($atime, $ctime, $mtime);
-	$atime = $ctime = $mtime = $finfo->{'modified'} || time;
-
-	#return the attribute values
-	return (
-		$dev,
-		$ino,
-		$modes,
-		$nlink,
-		$uid,
-		$gid,
-		$rdev,
-		$size,
-		$atime,
-		$mtime,
-		$ctime,
-		$blksize,
-		$blocks,
-	);
+	# generate and return the file attributes
+	return @{$self->_generateAttrs($finfo)};
 }
 
 sub fuse_getdir {
@@ -200,6 +219,9 @@ sub fuse_mkdir {
 	my $self = shift;
 	my ($path, $mode) = @_;
 	$path = $self->sanitize_path($path);
+
+	# throw an error if read-only is enabled
+	return -EACCES() if($self->_config->{'readonly'});
 
 	#create and delete a file to force path vivification
 	eval{
@@ -223,6 +245,9 @@ sub fuse_mknod {
 	my $self = shift;
 	my ($path) = @_;
 	$path = $self->sanitize_path($path);
+
+	# throw an error if read-only is enabled
+	return -EACCES() if($self->_config->{'readonly'});
 
 	#issue actual mknod callback
 	my $resp = $self->next::method(@_);
@@ -257,6 +282,9 @@ sub fuse_rename {
 	$old = $self->sanitize_path($old);
 	$new = $self->sanitize_path($new);
 
+	# throw an error if read-only is enabled
+	return -EACCES() if($self->_config->{'readonly'});
+
 	#throw an error if the new file already exists
 	return -EEXIST() if(defined $self->get_file_info($new));
 
@@ -290,6 +318,9 @@ sub fuse_truncate {
 	my ($path, $size) = @_;
 	$path = $self->sanitize_path($path);
 
+	# throw an error if read-only is enabled
+	return -EACCES() if($self->_config->{'readonly'});
+
 	#issue actual truncate callback
 	my $resp = $self->next::method(@_);
 
@@ -304,6 +335,9 @@ sub fuse_unlink {
 	my $self = shift;
 	my ($path) = @_;
 	$path = $self->sanitize_path($path);
+
+	# throw an error if read-only is enabled
+	return -EACCES() if($self->_config->{'readonly'});
 
 	#issue actual unlink callback
 	my $resp = $self->next::method(@_);

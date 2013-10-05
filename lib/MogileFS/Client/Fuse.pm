@@ -25,25 +25,29 @@ filesystem.
 
 use strict;
 use warnings;
+use MRO::Compat;
+use mro;
 use threads::shared;
 
-our $VERSION = 0.03;
+our $VERSION = 0.04;
 
-use Errno qw{EEXIST EIO ENOENT EOPNOTSUPP};
+use Errno qw{EACCES EEXIST EIO ENOENT EOPNOTSUPP};
 use Fcntl qw{O_WRONLY};
 use Fuse 0.11;
-use LWP;
+use LWP::UserAgent;
 use MogileFS::Client;
-use MogileFS::Client::Fuse::BufferedFile;
 use MogileFS::Client::Fuse::Constants qw{CALLBACKS :LEVELS THREADS};
-use MogileFS::Client::Fuse::File;
 use Params::Validate qw{validate_with ARRAYREF BOOLEAN SCALAR UNDEF};
+use POSIX qw{strftime};
 use Scalar::Util qw{blessed refaddr};
 
 ##Private static variables
 
 #variables to track the currently mounted Fuse object
 my %unshared;
+
+# custom file class counter (used to autogenerate a file package)
+my $fileClassIndex = 0;
 
 ##Static Methods
 
@@ -103,6 +107,7 @@ sub _init {
 			'loglevel'   => {'type' => SCALAR, 'default' => ERROR},
 			'mountopts'  => {'type' => SCALAR | UNDEF, 'default' => undef},
 			'mountpoint' => {'type' => SCALAR},
+			'readonly'   => {'type' => BOOLEAN, 'default' => undef},
 			'threaded'   => {'type' => BOOLEAN, 'default' => THREADS},
 			'trackers'   => {'type' => ARRAYREF},
 		},
@@ -113,6 +118,31 @@ sub _init {
 
 	#disable threads if they aren't loaded
 	$opt{'threaded'} = 0 if(!THREADS);
+
+	# generate the customized file class
+	{
+		my @classes;
+		push @classes, 'MogileFS::Client::Fuse::BufferedFile' if($opt{'buffered'});
+		push @classes, 'MogileFS::Client::Fuse::File';
+
+		# load the specified classes
+		eval "require $_;" foreach(@classes);
+		die $@ if($@);
+
+		# create file class
+		if(@classes > 1) {
+			$opt{'fileClass'} = 'MogileFS::Client::Fuse::File::Generated' . $fileClassIndex;
+			$fileClassIndex++;
+
+			no strict 'refs';
+			push @{$opt{'fileClass'} . '::ISA'}, @classes;
+			mro::set_mro($opt{'fileClass'}, 'c3');
+			Class::C3::reinitialize();
+		}
+		else {
+			$opt{'fileClass'} = $classes[0];
+		}
+	}
 
 	#initialize this object
 	$self->{'config'} = shared_clone({%opt});
@@ -148,7 +178,7 @@ sub log {
 	my $self = shift;
 	my ($level, $msg) = @_;
 	return if($level > $self->_config->{'loglevel'});
-	print STDERR $msg, "\n";
+	print STDERR strftime("[%Y-%m-%d %H:%M:%S] ", localtime), $msg, "\n";
 }
 
 #method that will return a MogileFS object
@@ -192,10 +222,17 @@ sub mount {
 
 		#create closure for this callback
 		no strict "refs";
-		$callbacks{$_} = sub {
-			$self->log(DEBUG, $method . '(' . join(', ', map {'"' . $_ . '"'} ($method eq 'fuse_write' ? ($_[0], length($_[1]).' bytes', @_[2,3]) : @_)) . ')') if($self->_config->{'loglevel'} >= DEBUG);
-			$self->$method(@_);
-		};
+		if($self->_config->{'loglevel'} >= DEBUG) {
+			$callbacks{$_} = sub {
+				$self->log(DEBUG, $method . '(' . join(', ', map {defined($_) ? '"' . $_ . '"' : 'undef'} ($method eq 'fuse_write' ? ($_[0], length($_[1]).' bytes', @_[2,3]) : @_)) . ')');
+				$self->$method(@_);
+			};
+		}
+		else {
+			$callbacks{$_} = sub {
+				$self->$method(@_);
+			};
+		}
 	}
 
 	#mount the MogileFS file system
@@ -223,18 +260,13 @@ sub mount {
 	return;
 }
 
-#thin wrapper for opening a file that can be overriden by subclasses as necessary
+#thin wrapper for opening a file
 sub openFile {
 	my $self = shift;
 	my ($path, $flags) = @_;
 
-	#pick the file class to use based on whether buffering is enabled or not
-	my $class =
-		$self->_config->{'buffered'} ? 'MogileFS::Client::Fuse::BufferedFile' :
-		'MogileFS::Client::Fuse::File';
-
 	#create a file object for the file being opened
-	return $class->new(
+	return $self->_config->{'fileClass'}->new(
 		'fuse'  => $self,
 		'path'  => $path,
 		'flags' => $flags,
@@ -242,15 +274,17 @@ sub openFile {
 }
 
 sub sanitize_path {
-	my $self = shift;
-	my ($path) = @_;
+#	my $self = shift;
+#	my ($path) = @_;
 
-	# Make sure we start everything from '/'
-	$path = '/' unless(length($path));
-	$path = '/' if($path eq '.');
-	$path = '/' . $path unless($path =~ m!^/!so);
+	# return the root path if a path wasn't specified
+	return '/' if(length($_[1]) == 0 || $_[1] eq '.');
 
-	return $path;
+	# make sure the path starts with a /
+	return '/' . $_[1] if($_[1] !~ m!^/!s);
+
+	# path doesn't need to be sanitized
+	return $_[1];
 }
 
 #method that will return an LWP UserAgent object
@@ -300,14 +334,40 @@ sub fuse_getdir {
 	return -EOPNOTSUPP();
 }
 
+sub fuse_getxattr {
+	my $self = shift;
+	my ($path, $name) = @_;
+
+	if($name =~ /^MogileFS\.(?:class|checksum)$/s) {
+		$path = $self->sanitize_path($path);
+		my $resp = eval {$self->MogileFS->file_info($path, {'devices' => 0})};
+		if($resp) {
+			return $resp->{'checksum'} if($name eq 'MogileFS.checksum');
+			return $resp->{'class'}    if($name eq 'MogileFS.class');
+		}
+	}
+
+	return 0;
+}
+
 sub fuse_link {
 	return -EOPNOTSUPP();
+}
+
+sub fuse_listxattr {
+	return (
+		'MogileFS.checksum',
+		'MogileFS.class',
+	), 0;
 }
 
 sub fuse_mknod {
 	my $self = shift;
 	my ($path) = @_;
 	$path = $self->sanitize_path($path);
+
+	# throw an error if read-only is enabled
+	return -EACCES() if($self->_config->{'readonly'});
 
 	#attempt creating an empty file
 	eval {$self->openFile($path, O_WRONLY)->release()};
@@ -373,8 +433,50 @@ sub fuse_rename {
 	return -EOPNOTSUPP();
 }
 
+sub fuse_setxattr {
+	my $self = shift;
+	my ($path, $name, $value, $flags) = @_;
+	$path = $self->sanitize_path($path);
+
+	# switch based on xattr name
+	if($name eq 'MogileFS.class') {
+		my $resp = eval {$self->MogileFS->update_class($path, $value)};
+		return -EIO() if(!$resp || $@);
+		return 0;
+	}
+
+	return -EOPNOTSUPP();
+}
+
 sub fuse_statfs {
-	return 255, 1, 1, 1, 1, 1024;
+	my $self = shift;
+
+	# retrieve all device stats
+	my $resp = eval {$self->MogileFS->{'backend'}->do_request('get_devices', {})};
+
+	# calculate the total and free space for the storage cluster in blocks
+	my $blkSize = 1024 * 1024;
+	my $total = 0;
+	my $free = 0;
+	for(my $i = 1;$i <= $resp->{'devices'}; $i++) {
+		my $dev = 'dev' . $i;
+		my $mbFree  = $resp->{$dev . '_mb_free'};
+		my $mbTotal = $resp->{$dev . '_mb_total'};
+		$free  += $mbFree  if($mbFree && $resp->{$dev . '_status'} eq 'alive' && $resp->{$dev . '_observed_state'} eq 'writeable');
+		$total += $mbTotal if($mbTotal);
+	}
+	$total *= (1024 * 1024) / $blkSize;
+	$free *= (1024 * 1024) / $blkSize;
+
+	# return the drive stats
+	return (
+		255,     # max name length
+		1,       # files
+		1,       # filesfree
+		$total,  # blocks
+		$free,   # blocks available
+		$blkSize # block size
+	);
 }
 
 sub fuse_symlink {
@@ -385,6 +487,9 @@ sub fuse_truncate {
 	my $self = shift;
 	my ($path, $size) = @_;
 	$path = $self->sanitize_path($path);
+
+	# throw an error if read-only is enabled
+	return -EACCES() if($self->_config->{'readonly'});
 
 	#attempt to truncate the specified file
 	eval{
@@ -402,6 +507,9 @@ sub fuse_unlink {
 	my $self = shift;
 	my ($path) = @_;
 	$path = $self->sanitize_path($path);
+
+	# throw an error if read-only is enabled
+	return -EACCES() if($self->_config->{'readonly'});
 
 	#attempt deleting the specified file
 	my $mogc = $self->MogileFS();
@@ -429,6 +537,9 @@ sub fuse_write {
 	my $offset = $_[2];
 	my $file = $_[3];
 
+	# throw an error if read-only is enabled
+	return -EACCES() if($self->_config->{'readonly'});
+
 	my $bytesWritten = eval{$file->write($buf, $offset)};
 	return -EIO() if($@);
 
@@ -446,6 +557,10 @@ requests using the Content-Range header.
 
 Currently deleting a directory is unsupported because it is not supported in the
 FilePaths MogileFS plugin.
+
+Multiple threads/processes simultaneously writing to the same open file handle
+is untested, it may work or it may corrupt the file due to unforeseen race
+conditions.
 
 =head1 AUTHOR
 

@@ -25,7 +25,9 @@ Module::Build->new(
 	'requires'           => {
 		'Fuse'                        => '0.11',
 		'MogileFS::Client::FilePaths' => 0,
+		'MRO::Compat'                 => 0,
 		'Params::Validate'            => 0,
 		'Scalar::Util'                => 0,
+		'threads::shared'             => '1.21',
 	},
 )->create_build_script();
